@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2021 Jeff Epler
+# SPDX-License-Identifier: GPL-3.0-only
+
 import functools
 import itertools
 import os
