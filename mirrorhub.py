@@ -7,7 +7,10 @@ import itertools
 import os
 import pathlib
 import subprocess
+import traceback
 from dataclasses import dataclass, fields
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 import click
 import platformdirs
@@ -47,6 +50,7 @@ def dataclass_fromdict(dc, /, **kw):
 class Settings:
     account_type: str
     name: str
+    repo_type: str = "all"
 
 
 @dataclass
@@ -96,25 +100,50 @@ def init(ctx, account_type, name):
     ctx.obj.settings = Settings(account_type=account_type, name=name)
 
 
-def list_remote_repos(settings):
-    result = []
+def request_with_token(url, headers=None, method=requests.get):
+    if headers is None:
+        headers = {"Authorization": f"Bearer {token()}"}
+    else:
+        headers.update({"Authorization": f"Bearer {token()}"})
+    return method(url, headers)
+
+
+def paginate(baseurl):
+    for page in itertools.count(1):
+        add = f"per_page=100&page={page}"
+        if "?" in baseurl:
+            url = baseurl + "&" + add
+        else:
+            url = baseurl + "?" + add
+        print(f"# getting {url}")
+        with request_with_token(url) as req:
+            if req.status_code != 200:
+                print(f"error {req.status_code=}")
+                break
+            content = req.json()
+            if not content:
+                break
+            yield from content
+            time.sleep(2)
+
+
+def iter_remote_repos(settings):
     for page in itertools.count(1):
         if settings.account_type == "organization":
             account_api = "orgs"
         else:
             account_api = "users"
-        url = f"https://api.github.com/{account_api}/{settings.name}/repos?page={page}"
+        url = f"https://api.github.com/{account_api}/{settings.name}/repos?page={page}&type={settings.repo_type}&per_page=100"
         headers = {"Authorization": f"Bearer {token()}"}
-        #        print(f"# getting {url}")
+        print(f"# getting {url}")
         with requests.get(url, headers=headers) as req:
             if req.status_code != 200:
+                print(f"error {req.status_code}")
                 break
             content = req.json()
-            #            print(content)
             if not content:
                 break
-            result.extend(content)
-    return result
+            yield from content
 
 
 def list_local_repos(path):
@@ -126,8 +155,8 @@ def list_local_repos(path):
 def remote_repos(ctx):
     if ctx.obj.settings is None:
         raise SystemExit("Not a mirrorhub directory")
-    for repo in list_remote_repos(ctx.obj.settings):
-        print(repo["html_url"])
+    for repo in iter_remote_repos(ctx.obj.settings):
+        print(repo["html_url"], repo["description"])
 
 
 @cli.command
@@ -140,7 +169,7 @@ def local_repos(ctx):
 
 
 def update_repo(path, clone_url):
-    print(f"Updating {path}\n\tfrom {clone_url}")
+    print(f"Updating {path}\n from {clone_url}")
     if path.exists():
         subprocess.check_call(["git", "--git-dir", path, "fetch", "--tags", "origin"])
     else:
@@ -153,12 +182,35 @@ def update(ctx):
     directory = ctx.obj.directory
     if ctx.obj.settings is None:
         raise SystemExit("Not a mirrorhub directory")
-    for repo in list_remote_repos(ctx.obj.settings):
+
+    def inner(repo):
         clone_url = repo["clone_url"]
         local_path = ctx.obj.directory / (repo["name"] + ".git")
         if not local_path.is_relative_to(local_path):
             raise SystemExit("Path would be outside base: {local_path}")
         update_repo(local_path, clone_url)
+        description = repo.get("description")
+        if description:
+            print(f"will set repo description to {description!r}")
+            subprocess.check_call(
+                [
+                    "git",
+                    "--git-dir",
+                    local_path,
+                    "config",
+                    "x-mirrorhub.description",
+                    description
+                ]
+            )
+
+    def inner_wrap(repo):
+        try:
+            inner(repo)
+        except Exception as e:
+            traceback.print_exc()
+
+    with ThreadPoolExecutor() as pool:
+        pool.map(inner_wrap, iter_remote_repos(ctx.obj.settings))
 
 
 if __name__ == "__main__":
